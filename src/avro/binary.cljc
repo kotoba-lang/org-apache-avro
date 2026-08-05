@@ -1,0 +1,101 @@
+(ns avro.binary
+  "Avro's binary encoding — the value grammar, with nothing about files in it.
+
+  Its own namespace for the reason `parquet.thrift` is: this is a
+  self-contained byte grammar, and keeping it apart is what lets it be tested
+  against sequences taken from the specification rather than against this
+  repo's idea of an Avro file.
+
+  ## Everything variable-length is a zigzag varint
+
+  Ints, longs, string lengths, byte lengths, array block counts, union
+  branches. One reader, used everywhere, which is why getting its sign
+  handling right matters more here than the small amount of code suggests: a
+  varint read as unsigned turns every negative int into a large positive one
+  and every union branch index into nonsense, and both still decode to
+  *something*.
+
+  ## Ints and longs share an encoding but not a range
+
+  Avro writes both as zigzag varints and distinguishes them only in the
+  schema. So a decoder cannot tell from the bytes whether a value was meant to
+  fit in 32 bits, and this namespace does not try — `long` is what both
+  produce. On ClojureScript a magnitude past 2^53 is refused rather than
+  rounded, the same rule the Parquet and Arrow readers apply."
+  (:refer-clojure :exclude [bytes long double]))
+
+(defn- u8 [bs i] (nth bs i))
+
+(defn varint
+  "Raw ULEB128 at `i` → `[value next-index]`.
+
+  Bounded at 10 bytes: a longer one cannot be a valid 64-bit value and is a
+  corrupt or hostile file trying to make the decoder loop."
+  [bs i]
+  (loop [i i shift 0 acc 0 n 0]
+    (when (> n 10)
+      (throw (ex-info "varint too long" {:type :avro/malformed :at i})))
+    (let [b (u8 bs i)
+          acc (+ acc (* (bit-and b 0x7f)
+                        #?(:clj (bit-shift-left 1 shift) :cljs (Math/pow 2 shift))))]
+      (if (zero? (bit-and b 0x80))
+        [acc (inc i)]
+        (recur (inc i) (+ shift 7) acc (inc n))))))
+
+(defn zigzag
+  "Unsigned → signed. Small negatives are small varints, which is the whole
+  reason the encoding exists."
+  [n]
+  #?(:clj (let [n (clojure.core/long n)]
+            (bit-xor (unsigned-bit-shift-right n 1) (- (bit-and n 1))))
+     :cljs (do (when (> n js/Number.MAX_SAFE_INTEGER)
+                 (throw (ex-info "integer exceeds this runtime's exact range"
+                                 {:type :avro/precision-unavailable :approx n})))
+               (let [q (Math/floor (/ n 2))]
+                 (if (zero? (bit-and n 1)) q (- (- q) 1))))))
+
+(defn long-at
+  "Signed long at `i` → `[value next-index]`."
+  [bs i]
+  (let [[v i'] (varint bs i)] [(zigzag v) i']))
+
+(defn bytes-at
+  "Length-prefixed bytes at `i` → `[byte-vector next-index]`."
+  [bs i]
+  (let [[n i'] (long-at bs i)
+        n (clojure.core/long n)]
+    (when (neg? n)
+      (throw (ex-info "negative length" {:type :avro/malformed :at i :length n})))
+    [(subvec (vec bs) i' (+ i' n)) (+ i' n)]))
+
+(defn utf8 [raw]
+  #?(:clj (String. (byte-array (map unchecked-byte raw)) "UTF-8")
+     :cljs (.decode (js/TextDecoder. "utf-8") (js/Uint8Array. (clj->js (vec raw))))))
+
+(defn string-at [bs i]
+  (let [[raw i'] (bytes-at bs i)] [(utf8 raw) i']))
+
+(defn- le-bits
+  "`n` little-endian bytes at `i` as an integer. n is 4 or 8, and the result is
+  a bit pattern rather than a number — the caller reinterprets it as a float."
+  [bs i n]
+  #?(:clj (loop [k 0 acc 0]
+            (if (= k n)
+              acc
+              (recur (inc k) (bit-or acc (bit-shift-left (clojure.core/long (u8 bs (+ i k)))
+                                                         (* 8 k))))))
+     :cljs (let [a (js/Uint8Array. n)]
+             (dotimes [k n] (aset a k (u8 bs (+ i k))))
+             a)))
+
+(defn double-at [bs i]
+  (let [v #?(:clj (Double/longBitsToDouble (le-bits bs i 8))
+             :cljs (.getFloat64 (js/DataView. (.-buffer (le-bits bs i 8))) 0 true))]
+    [v (+ i 8)]))
+
+(defn float-at [bs i]
+  (let [v #?(:clj (Float/intBitsToFloat (unchecked-int (le-bits bs i 4)))
+             :cljs (.getFloat32 (js/DataView. (.-buffer (le-bits bs i 4))) 0 true))]
+    [v (+ i 4)]))
+
+(defn boolean-at [bs i] [(not (zero? (u8 bs i))) (inc i)])

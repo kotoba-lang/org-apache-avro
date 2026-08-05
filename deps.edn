@@ -1,0 +1,30 @@
+{:paths ["src"]
+ ;; No columnar. Avro is row-oriented and self-describing: there is no footer,
+ ;; no per-chunk statistics and no way to read one column without reading the
+ ;; records around it, so it is a `:materialize` format and has nothing to
+ ;; provide `IColumnSource` with. Depending on the engine would advertise a
+ ;; capability the format does not have.
+ :deps {;; Avro schemas are JSON, carried inside the file that uses them.
+        io.github.kotoba-lang/json
+        {:git/url "https://github.com/kotoba-lang/json.git"
+         :git/sha "f6a534458ddfcb88e5e03facb35ebf61902e1bc4"}
+        ;; The `deflate` codec is raw DEFLATE, not gzip -- Avro carries no
+        ;; gzip header, so this uses inflate-raw rather than gunzip.
+        io.github.kotoba-lang/org-ietf-deflate
+        {:git/url "https://github.com/kotoba-lang/org-ietf-deflate.git"
+         :git/sha "430d754313e9082114ec00554e0b6770d9d318c5"}
+        ;; The `zstandard` codec, same decoder the Parquet and Arrow readers use.
+        io.github.kotoba-lang/org-ietf-zstd
+        {:git/url "https://github.com/kotoba-lang/org-ietf-zstd.git"
+         :git/sha "5362525f26e1dd7646cf917e9b485df2028c3967"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :main-opts ["-m" "cognitect.test-runner"]
+         :exec-fn cognitect.test-runner.api/test}
+  :cljs {:extra-paths ["test"]
+         :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}}
+  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
+         :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
+                     "--fail-level" "error"]}}}
