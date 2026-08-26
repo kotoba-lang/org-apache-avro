@@ -21,8 +21,32 @@
   schema. So a decoder cannot tell from the bytes whether a value was meant to
   fit in 32 bits, and this namespace does not try — `long` is what both
   produce. On ClojureScript a magnitude past 2^53 is refused rather than
-  rounded, the same rule the Parquet and Arrow readers apply."
+  rounded, the same rule the Parquet and Arrow readers apply.
+
+  ## Opting into exact 64-bit values on ClojureScript
+
+  Refusing is the right default: a rounded 64-bit identifier is worse than
+  no identifier, because it still looks like one. But a file can carry a
+  full-width long in a field the reader does not care about — an Iceberg
+  manifest names its data files in a string and its snapshot in a 64-bit
+  id — and refusing the record loses the string along with the id.
+
+  Binding `*long-mode*` to `:bigint` decodes exactly those values as a
+  **BigInt**, which is exact. Values that fit stay plain numbers, so no
+  caller has to handle two types for small values:
+
+      (binding [avro.binary/*long-mode* :bigint]
+        (avro.file/records manifest-bytes))
+
+  The default is unchanged, and this is additive: nothing that decoded
+  before decodes differently now."
   (:refer-clojure :exclude [bytes long double]))
+
+(def ^{:dynamic true
+       :doc "`:exact-or-refuse` (default) throws on a ClojureScript value
+  past 2^53; `:bigint` returns a BigInt for exactly those values. Inert on
+  the JVM, where a long is a long."}
+  *long-mode* :exact-or-refuse)
 
 (defn- u8 [bs i] (nth bs i))
 
@@ -32,15 +56,30 @@
   Bounded at 10 bytes: a longer one cannot be a valid 64-bit value and is a
   corrupt or hostile file trying to make the decoder loop."
   [bs i]
-  (loop [i i shift 0 acc 0 n 0]
-    (when (> n 10)
-      (throw (ex-info "varint too long" {:type :avro/malformed :at i})))
-    (let [b (u8 bs i)
-          acc (+ acc (* (bit-and b 0x7f)
-                        #?(:clj (bit-shift-left 1 shift) :cljs (Math/pow 2 shift))))]
-      (if (zero? (bit-and b 0x80))
-        [acc (inc i)]
-        (recur (inc i) (+ shift 7) acc (inc n))))))
+  #?(:clj
+     (loop [i i shift 0 acc 0 n 0]
+       (when (> n 10)
+         (throw (ex-info "varint too long" {:type :avro/malformed :at i})))
+       (let [b (u8 bs i)
+             acc (+ acc (* (bit-and b 0x7f) (bit-shift-left 1 shift)))]
+         (if (zero? (bit-and b 0x80))
+           [acc (inc i)]
+           (recur (inc i) (+ shift 7) acc (inc n)))))
+     :cljs
+     ;; Accumulated as a BigInt whatever the mode. `(Math/pow 2 shift)` is
+     ;; exact only to 2^53, so a full-width varint accumulated as a double
+     ;; is ALREADY wrong before `zigzag` can decide what to do about it --
+     ;; the old code could only refuse a value whose bytes it had already
+     ;; corrupted. Narrowing back to a plain number happens once, in
+     ;; `zigzag`, which is where the mode is known.
+     (loop [i i mult (js/BigInt 1) acc (js/BigInt 0) n 0]
+       (when (> n 10)
+         (throw (ex-info "varint too long" {:type :avro/malformed :at i})))
+       (let [b (u8 bs i)
+             acc (+ acc (* (js/BigInt (bit-and b 0x7f)) mult))]
+         (if (zero? (bit-and b 0x80))
+           [acc (inc i)]
+           (recur (inc i) (* mult (js/BigInt 128)) acc (inc n)))))))
 
 (defn zigzag
   "Unsigned → signed. Small negatives are small varints, which is the whole
@@ -48,11 +87,35 @@
   [n]
   #?(:clj (let [n (clojure.core/long n)]
             (bit-xor (unsigned-bit-shift-right n 1) (- (bit-and n 1))))
-     :cljs (do (when (> n js/Number.MAX_SAFE_INTEGER)
-                 (throw (ex-info "integer exceeds this runtime's exact range"
-                                 {:type :avro/precision-unavailable :approx n})))
-               (let [q (Math/floor (/ n 2))]
-                 (if (zero? (bit-and n 1)) q (- (- q) 1))))))
+     :cljs
+     ;; `n` arrives as a BigInt from `varint`. The undo is arithmetic rather
+     ;; than bitwise: `>>>` is not defined on BigInt, and BigInt division
+     ;; already truncates toward zero, which is what the shift meant.
+     ;;
+     ;; Every comparison and test below is done on plain numbers derived
+     ;; from the BigInt, not on the BigInt itself: `zero?`, `neg?` and
+     ;; friends are polymorphic in ClojureScript and their behaviour on
+     ;; BigInt is not something this decoder should be betting on.
+     (let [big (fn [x] (js/BigInt x))
+           n (if (number? n) (big n) n)
+           two (big 2)
+           q (/ n two)
+           low (js/Number (- n (* q two)))       ; 0 or 1
+           v (if (zero? low) q (- (- q) (big 1)))
+           neg? (= "-" (subs (str v) 0 1))
+           mag (if neg? (- v) v)
+           safe (big js/Number.MAX_SAFE_INTEGER)]
+       (if (zero? (js/Number (/ mag (+ safe (big 1)))))
+         ;; |v| <= MAX_SAFE_INTEGER: hand back a plain number, so a caller
+         ;; never sees two types for a small value.
+         (js/Number v)
+         (case *long-mode*
+           :bigint v
+           (throw (ex-info "integer exceeds this runtime's exact range"
+                           {:type :avro/precision-unavailable
+                            :exact (str v)
+                            :hint (str "bind avro.binary/*long-mode* to :bigint "
+                                       "to receive a BigInt")})))))))
 
 (defn long-at
   "Signed long at `i` → `[value next-index]`."
