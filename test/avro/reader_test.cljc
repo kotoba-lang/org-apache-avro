@@ -7,7 +7,8 @@
   **Avro writes no type tags** — a decoder that is wrong about the schema
   produces plausible values rather than an error, so a self-generated fixture
   would agree with a wrong decoder."
-  (:require [avro.file :as file]
+  (:require [avro.binary :as b]
+            [avro.file :as file]
             [avro.schema :as schema]
             [clojure.edn :as edn]
             [clojure.test :refer [deftest is testing]]
@@ -154,3 +155,49 @@
                              "{\"name\":\"next\",\"type\":[\"null\",\"Node\"]}]}"))]
     (is (= :record (:type s)))
     (is (= ["next"] (schema/record-fields s)))))
+
+;; ---------------------------------------------------------------------------
+;; 64-bit values on ClojureScript
+;;
+;; Added when an Iceberg manifest-list turned out to be unreadable here: it
+;; carries `snapshot_id` as a full-width long, and the decoder refused the
+;; whole record -- losing the `manifest_path` string beside it.
+
+(deftest zigzag-round-trips-small-values
+  ;; The control. These are the values the encoding exists to make small,
+  ;; and they must stay plain numbers with the right signs.
+  (is (= [0 -1 1 -2 2 -3 3] (map b/zigzag [0 1 2 3 4 5 6]))))
+
+#?(:cljs
+   (deftest zigzag-is-exact-past-2-to-the-53
+     (testing "the default still refuses -- a rounded 64-bit id is worse
+               than no id, because it still looks like an id"
+       (is (thrown? js/Error (b/zigzag (js/BigInt "8086998819667279592")))))
+     (testing ":bigint returns the exact value"
+       (binding [b/*long-mode* :bigint]
+         ;; This is a real Iceberg snapshot id, and 4043499409833639796 is
+         ;; not representable as a double: the nearest double is
+         ;; 4043499409833639936, off by 140.
+         (is (= "4043499409833639796"
+                (str (b/zigzag (js/BigInt "8086998819667279592")))))))
+     (testing "a value that FITS is still a plain number in both modes --
+               a caller must not have to handle two types for small values"
+       (binding [b/*long-mode* :bigint]
+         (is (number? (b/zigzag (js/BigInt 4))))
+         (is (= 2 (b/zigzag (js/BigInt 4))))))))
+
+#?(:cljs
+   (deftest varint-accumulates-exactly
+     ;; The bug this fixes was in `varint`, not `zigzag`: accumulating with
+     ;; `(Math/pow 2 shift)` corrupts a full-width value BEFORE anything can
+     ;; decide to refuse it, so the old code could only refuse a number it
+     ;; had already got wrong.
+     ;;
+     ;; These bytes are the ULEB128 of 8086998819667279592, COMPUTED, not
+     ;; transcribed -- a first pass wrote plausible-looking bytes by hand and
+     ;; they decoded to 8099041353800686696, which is what a wrong fixture
+     ;; looks like: a number.
+     (let [bs [0xE8 0xFD 0x95 0xCA 0xC6 0xD2 0xB2 0x9D 0x70]
+           [v _] (b/varint bs 0)]
+       (is (= "8086998819667279592" (str v))
+           "the raw varint must be exact before zigzag sees it"))))
