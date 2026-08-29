@@ -3,3 +3,4 @@
 .cljs_node_repl/
 target/
 out/
+.venv/

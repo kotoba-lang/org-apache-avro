@@ -1,5 +1,6 @@
 (ns avro.binary
-  "Avro's binary encoding — the value grammar, with nothing about files in it.
+  "Avro's binary encoding — the value grammar, with nothing about files in it,
+  in both directions.
 
   Its own namespace for the reason `parquet.thrift` is: this is a
   self-contained byte grammar, and keeping it apart is what lets it be tested
@@ -162,3 +163,100 @@
     [v (+ i 4)]))
 
 (defn boolean-at [bs i] [(not (zero? (u8 bs i))) (inc i)])
+
+;; ---------------------------------------------------------------------------
+;; Encoding. The mirror of everything above.
+;;
+;; Kept in this namespace rather than a separate `avro.write` for the reason
+;; the namespace exists at all: this is the value grammar, and a grammar
+;; written down twice in two places drifts. `varint-of` and `varint` are the
+;; same rule read forwards and backwards, and they should be read together.
+;;
+;; Every encoder returns a **vector of unsigned bytes** (0-255), the same
+;; shape the decoders consume, so `(decode (encode v)) == v` is a
+;; composition of functions in this file and not an integration test.
+;; ---------------------------------------------------------------------------
+
+(defn varint-of
+  "Non-negative `n` → ULEB128 bytes.
+
+  `n` is the ALREADY-ZIGZAGGED value, i.e. unsigned. On the JVM that unsigned
+  64-bit quantity is carried in a signed long, so the shift has to be
+  `unsigned-bit-shift-right` -- an arithmetic shift would sign-extend and turn
+  a large value into an endless stream of 0xFF."
+  [n]
+  #?(:clj
+     (loop [n (clojure.core/long n) out []]
+       (if (zero? (bit-and n (bit-not 0x7f)))
+         (conj out (unchecked-int n))
+         (recur (unsigned-bit-shift-right n 7)
+                (conj out (unchecked-int (bit-or 0x80 (bit-and n 0x7f)))))))
+     :cljs
+     ;; BigInt throughout: `n` can exceed 2^53 and the loop must not round.
+     ;; `js/BigInt` on a non-integer number throws, which is the right
+     ;; failure -- a fractional value reaching an integer encoder is a bug in
+     ;; the caller, not something to truncate silently.
+     ;;
+     ;; The remainder is taken arithmetically rather than with `mod`, and the
+     ;; BigInt test is `number?`, both for the same reason `zigzag` does it
+     ;; that way: `mod`/`zero?`/`neg?` are polymorphic in ClojureScript and
+     ;; their behaviour on BigInt is not something this grammar should bet on.
+     (loop [n (if (number? n) (js/BigInt n) n) out []]
+       (let [c128 (js/BigInt 128)
+             q (/ n c128)
+             low (js/Number (- n (* q c128)))]
+         (if (zero? (js/Number q))
+           (conj out low)
+           (recur q (conj out (bit-or 0x80 low))))))))
+
+(defn zigzag-of
+  "Signed → unsigned. The inverse of `zigzag`.
+
+  Written arithmetically (`2v` / `-2v-1`) rather than as `(v << 1) ^ (v >> 63)`
+  because the arithmetic form is the same expression on both runtimes and on
+  BigInt, where `<<` and `>>` are not the operators the shift form assumes."
+  [v]
+  #?(:clj (let [v (clojure.core/long v)]
+            (bit-xor (bit-shift-left v 1) (bit-shift-right v 63)))
+     :cljs (let [v (if (number? v) (js/BigInt v) v)
+                 two (js/BigInt 2)]
+             (if (= "-" (subs (str v) 0 1))
+               (- (* (- v) two) (js/BigInt 1))
+               (* v two)))))
+
+(defn long-of "Signed long → zigzag varint bytes." [v] (varint-of (zigzag-of v)))
+
+(defn bytes-of
+  "Raw bytes → length-prefixed bytes."
+  [raw] (into (long-of (count raw)) (map #(bit-and % 0xff)) raw))
+
+(defn utf8-of
+  "String → UTF-8 bytes (no length prefix)."
+  [s]
+  #?(:clj (vec (map #(bit-and % 0xff) (.getBytes (str s) "UTF-8")))
+     :cljs (vec (.encode (js/TextEncoder.) (str s)))))
+
+(defn string-of "String → length-prefixed UTF-8." [s] (bytes-of (utf8-of s)))
+
+#?(:clj
+   (defn- le-of
+     "Integer bit pattern → `n` little-endian bytes. JVM only: ClojureScript
+  reaches the same bytes through a DataView and never calls this."
+     [bits n]
+     (mapv #(unchecked-int (bit-and (unsigned-bit-shift-right
+                                     (clojure.core/long bits) (* 8 %)) 0xff))
+           (range n))))
+
+(defn double-of [v]
+  #?(:clj (le-of (Double/doubleToLongBits (clojure.core/double v)) 8)
+     :cljs (let [dv (js/DataView. (js/ArrayBuffer. 8))]
+             (.setFloat64 dv 0 v true)
+             (vec (js/Uint8Array. (.-buffer dv))))))
+
+(defn float-of [v]
+  #?(:clj (le-of (bit-and (clojure.core/long (Float/floatToIntBits (float v))) 0xffffffff) 4)
+     :cljs (let [dv (js/DataView. (js/ArrayBuffer. 4))]
+             (.setFloat32 dv 0 v true)
+             (vec (js/Uint8Array. (.-buffer dv))))))
+
+(defn boolean-of [v] [(if v 1 0)])
