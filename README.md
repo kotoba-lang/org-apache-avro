@@ -1,14 +1,21 @@
 # org-apache-avro
 
-**An Avro Object Container File reader in portable `.cljc`.** No JNI, no
-native library, no code generation — the format is decoded from bytes.
+**An Avro Object Container File reader and writer in portable `.cljc`.** No
+JNI, no native library, no code generation — the format is decoded from, and
+encoded to, bytes.
 
 ```clojure
 (require '[avro.file :as avro])
 
 (avro/file-schema bytes)   ; the schema the file carries
+(avro/schema-json bytes)   ; ...as the JSON text it is stored as
 (avro/records bytes)       ; => [{"price" 10 "region" "east" ...} ...]
 (avro/record-count bytes)  ; from block headers alone
+
+(avro/write {:schema {"type" "record" "name" "Sale"
+                      "fields" [{"name" "price" "type" "long"}]}
+             :records [{"price" 10}]
+             :codec "deflate"})   ; => the bytes of a container file
 ```
 
 Origin plane: the format is Apache's, so the repo is named for where it comes
@@ -59,6 +66,36 @@ next block's length as a record — **producing values**, which is the failure
 mode worth one comparison per block to avoid. There is a test that flips a bit
 in the last marker.
 
+## Writing
+
+`write` takes the schema as JSON — a string used verbatim, or data encoded
+with `json.core/encode` — and **encodes the records with the same schema it
+writes into the file**. That is the writing half of the property this format
+is built around: a reader takes the schema from the bytes, so a writer and a
+reader cannot be handed disagreeing ones.
+
+Encoding has one decision decoding does not have to make. Reading a union is
+told its branch by an index in the bytes; writing one has to choose from the
+value, and Avro offers the writer no help — a union of bytes-or-array is two
+schemas that both accept a sequence. `write` takes the first branch that
+accepts the value and **refuses when none does**, rather than defaulting to
+branch 0: a value written under the wrong branch produces a file that decodes
+without error into the wrong thing, which is the encoder's version of the
+desynchronisation described above. The union that appears in real data, and in
+every Iceberg manifest, is the nullable one, which is never ambiguous.
+
+Three other things it refuses rather than guesses: a `fixed` of the wrong
+length (it would consume the next field's bytes on the way back in), a value
+outside an `enum`'s symbols, and a **missing record field whose schema cannot
+be null** — Avro has no way to say "absent", so filling one in would write a
+value the caller never supplied. A missing field whose schema is nullable is
+written as null, which is the one case where the format can say what happened.
+
+Blocks default to 1000 records. Blocks are what let a reader walk or skip a
+file without decoding it, so one giant block gives it nothing to walk. `:sync`
+overrides the random marker for a caller that needs the same input to produce
+the same bytes.
+
 ## What it decodes, and what it refuses by name
 
 ```
@@ -69,7 +106,11 @@ types
   enum / fixed
 
 codecs
-  null / deflate (RAW, no gzip header) / zstandard
+  read    null / deflate (RAW, no gzip header) / zstandard
+  write   null / deflate / zstandard — but zstandard does NOT compress:
+          org-ietf-zstd writes conformant frames of raw blocks and has no
+          encoder, so the codec name is available and the bytes are not
+          smaller. Present so a caller who must emit that name can.
 
 refused, by name
   snappy — Avro's CRC-32C framing, see above
@@ -94,6 +135,21 @@ misunderstanding is invisible.
 
 `multi-block.avro` uses a tiny sync interval on purpose: a single-block file
 cannot tell a correct block walk from one that never moved.
+
+The oracle points **both** ways. `generate.py` has fastavro write files this
+repo reads. `verify_written.py` has this repo write files fastavro reads —
+which is the direction that catches a nonconformant writer, because a
+round-trip inside this repo proves only that the writer and reader agree with
+each other, and two halves of one misunderstanding do that perfectly.
+
+```
+python3 -m venv .venv && .venv/bin/pip install fastavro
+.venv/bin/python test/fixtures/verify_written.py
+```
+
+It runs the writer itself, so there is no fixture to go stale, and it has been
+shown to fail: removing the zero terminator from an array block makes fastavro
+refuse the file and the script exit 1.
 
 ## Portability, and 64-bit integers
 

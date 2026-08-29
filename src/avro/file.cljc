@@ -24,6 +24,7 @@
             [avro.datum :as datum]
             [avro.schema :as schema]
             [deflate.core :as deflate]
+            [json.core :as json]
             [zstd.core :as zstd]))
 
 (def magic [0x4F 0x62 0x6A 0x01])          ; "Obj\1"
@@ -61,6 +62,7 @@
     {:schema (schema/parse (b/utf8 (or (get meta "avro.schema")
                                        (throw (ex-info "file declares no avro.schema"
                                                        {:type :avro/malformed})))))
+     :meta meta
      :codec codec
      :sync (vec (subvec (vec bs) i (+ i sync-size)))
      :at (+ i sync-size)}))
@@ -108,6 +110,17 @@
 
 (defn file-schema [bs] (:schema (header bs)))
 
+(defn schema-json
+  "The file's `avro.schema` metadata, as the JSON text it is stored as.
+
+  `file-schema` gives the resolved shape, which is what decoding needs and
+  what a caller reasons about. This gives the bytes' own words, which is what
+  REWRITING needs: `(write {:schema (schema-json bs) :records (records bs)})`
+  reproduces a file without this repo having to be able to render a resolved
+  schema back into JSON -- a second serialiser that could disagree with the
+  first."
+  [bs] (b/utf8 (get (:meta (header bs)) "avro.schema")))
+
 (defn records
   "Every record in the file, decoded.
 
@@ -125,3 +138,87 @@
                                          [(conj acc v) j']))
                                      [[] 0] (range count))))))
           (blocks bs))))
+
+;; ---------------------------------------------------------------------------
+;; Writing.
+;; ---------------------------------------------------------------------------
+
+(def encodable-codecs
+  "Codecs this writer can produce.
+
+  `snappy` is absent for the same reason `decodable-codecs` omits it: Avro
+  frames snappy with a trailing big-endian CRC-32C this repo does not compute,
+  and emitting the frame without it would produce a file every conformant
+  reader rejects.
+
+  `zstandard` is present but does not compress -- `org-ietf-zstd` writes
+  conformant frames of raw blocks and has no encoder. It is here so a caller
+  who must emit that codec name can, not because it saves bytes."
+  #{"null" "deflate" "zstandard"})
+
+(defn- compress [codec block]
+  (case codec
+    "null" (vec block)
+    "deflate" (vec (deflate/deflate-raw block))
+    "zstandard" (vec (zstd/compress block))
+    (throw (ex-info (str "avro: cannot write codec " (pr-str codec))
+                    {:type :avro/unsupported-codec :codec codec
+                     :encodable (vec encodable-codecs)}))))
+
+(defn- random-sync []
+  ;; A delimiter, not a secret: its job is to be unlikely to occur inside the
+  ;; encoded data, so that a truncated block is detected rather than decoded.
+  ;; `rand-int` is adequate for that and portable; callers who need a
+  ;; byte-identical file pass `:sync` instead.
+  (vec (repeatedly sync-size #(rand-int 256))))
+
+(defn- metadata-block
+  "map<string,bytes> in Avro's block framing: count, pairs, terminator."
+  [m]
+  (into (into (b/long-of (count m))
+              (mapcat (fn [[k v]] (into (b/string-of k) (b/bytes-of v))))
+              m)
+        (b/long-of 0)))
+
+(defn write
+  "Records → the bytes of an Avro Object Container File.
+
+      (avro.file/write {:schema {\"type\" \"record\" \"name\" \"Sale\"
+                                 \"fields\" [{\"name\" \"price\" \"type\" \"long\"}]}
+                        :records [{\"price\" 10}]
+                        :codec \"deflate\"})
+
+  `:schema` is JSON — either a string used verbatim, or data this encodes with
+  `json.core/encode`. **The same schema is written into the file and used to
+  encode the records**, which is the writing half of the property `avro.file`
+  is built around: a reader takes the schema from the file, so writer and
+  reader cannot be given disagreeing ones.
+
+  `:codec` defaults to the null codec. `:records-per-block` defaults to 1000 --
+  blocks exist so a reader can walk or skip without decoding, and one giant
+  block gives it nothing to walk. `:sync` overrides the random marker, for a
+  caller that needs the same input to produce the same bytes."
+  [{:keys [schema records codec sync records-per-block]
+    :or {codec "null" records-per-block 1000}}]
+  (when-not (encodable-codecs codec)
+    (throw (ex-info (str "avro: cannot write codec " (pr-str codec))
+                    {:type :avro/unsupported-codec :codec codec
+                     :encodable (vec encodable-codecs)})))
+  (let [schema-json (if (string? schema) schema (json/encode schema))
+        resolved (schema/parse schema-json)
+        sync (or sync (random-sync))]
+    (when-not (= sync-size (count sync))
+      (throw (ex-info "avro: sync marker must be 16 bytes"
+                      {:type :avro/malformed :actual (count sync)})))
+    (into (into (vec magic)
+                (metadata-block {"avro.schema" (b/utf8-of schema-json)
+                                 "avro.codec" (b/utf8-of codec)}))
+          (into (vec sync)
+                (mapcat (fn [chunk]
+                          (let [body (compress codec
+                                               (into [] (mapcat #(datum/encode resolved %)) chunk))]
+                            (-> (b/long-of (count chunk))
+                                (into (b/long-of (count body)))
+                                (into body)
+                                (into sync))))
+                        (partition-all records-per-block records))))))
