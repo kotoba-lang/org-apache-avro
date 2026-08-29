@@ -173,3 +173,22 @@
       (is (= (get @truth "rows") rows) "the fixture still means what it meant")
       (is (= (get @truth "rows") (file/records ours))
           "and so does our rewrite of it"))))
+
+(deftest caller-metadata-survives-the-round-trip
+  (testing "the container metadata map is part of the format, not a comment"
+    (let [bs (file/write {:schema sale-schema :records sales
+                          :meta {"schema" "{}" "format-version" "2"}})
+          m (file/metadata bs)]
+      (is (= "{}" (get m "schema")))
+      (is (= "2" (get m "format-version")))
+      (testing "alongside the derived entries, not instead of them"
+        (is (= "null" (get m "avro.codec")))
+        (is (some? (get m "avro.schema"))))
+      (is (= sales (file/records bs)) "and the records still decode"))))
+
+(deftest derived-metadata-keys-are-refused
+  (testing "a file whose declared schema and encoding schema disagree is what write exists to prevent"
+    (doseq [k ["avro.schema" "avro.codec"]]
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (file/write {:schema sale-schema :records sales :meta {k "x"}}))
+          k))))
