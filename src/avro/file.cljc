@@ -110,6 +110,15 @@
 
 (defn file-schema [bs] (:schema (header bs)))
 
+(defn metadata
+  "The file's metadata map, values decoded as UTF-8 strings.
+
+  `avro.schema` and `avro.codec` are in here too; `schema-json` and
+  `file-schema` are the named accessors for the first because that is the one
+  every reader needs. Iceberg's manifest metadata (`schema`,
+  `partition-spec`, `format-version`) is reached through this."
+  [bs] (into {} (map (fn [[k v]] [k (b/utf8 v)])) (:meta (header bs))))
+
 (defn schema-json
   "The file's `avro.schema` metadata, as the JSON text it is stored as.
 
@@ -197,8 +206,16 @@
   `:codec` defaults to the null codec. `:records-per-block` defaults to 1000 --
   blocks exist so a reader can walk or skip without decoding, and one giant
   block gives it nothing to walk. `:sync` overrides the random marker, for a
-  caller that needs the same input to produce the same bytes."
-  [{:keys [schema records codec sync records-per-block]
+  caller that needs the same input to produce the same bytes.
+
+  `:meta` adds entries to the file's metadata map, which is part of the
+  container format and not a comment field: Apache Iceberg keeps a manifest's
+  table schema and partition spec there, and a manifest without them is not
+  readable as a manifest. Values may be strings (encoded UTF-8) or byte
+  sequences. `avro.schema` and `avro.codec` are derived and rejected if
+  passed -- a file whose declared schema and encoding schema disagree is
+  exactly what this writer is built to make impossible."
+  [{:keys [schema records codec sync records-per-block meta]
     :or {codec "null" records-per-block 1000}}]
   (when-not (encodable-codecs codec)
     (throw (ex-info (str "avro: cannot write codec " (pr-str codec))
@@ -210,9 +227,15 @@
     (when-not (= sync-size (count sync))
       (throw (ex-info "avro: sync marker must be 16 bytes"
                       {:type :avro/malformed :actual (count sync)})))
+    (when-let [reserved (seq (filter #{"avro.schema" "avro.codec"} (keys meta)))]
+      (throw (ex-info (str "avro: " (vec reserved) " is derived, not caller-set")
+                      {:type :avro/reserved-metadata :keys (vec reserved)})))
     (into (into (vec magic)
-                (metadata-block {"avro.schema" (b/utf8-of schema-json)
-                                 "avro.codec" (b/utf8-of codec)}))
+                (metadata-block (into {"avro.schema" (b/utf8-of schema-json)
+                                       "avro.codec" (b/utf8-of codec)}
+                                      (map (fn [[k v]]
+                                             [k (if (string? v) (b/utf8-of v) (vec v))]))
+                                      meta)))
           (into (vec sync)
                 (mapcat (fn [chunk]
                           (let [body (compress codec
