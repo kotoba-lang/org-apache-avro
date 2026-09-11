@@ -21,7 +21,7 @@ jobs:
       # a magnitude past 2^53 is refused rather than rounded -- a claim only a
       # runtime whose numbers are doubles can check.
       - name: ClojureScript (nbb, interpreted)
-        run: nbb --classpath "src:test:$(clojure -Spath)" test/run.cljs
+        run: nbb --classpath "src:test:$(clojure -Spath)" test/run.cljk
       - name: ClojureScript (cljs.main, compiled)
         run: clojure -M:cljs -m cljs.main --target node -m avro.cljs-runner
 
