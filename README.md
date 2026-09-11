@@ -171,10 +171,10 @@ That is a consequence of row-orientation, not a choice — and it is why
 ## Tests
 
 ```
-clojure -M:test
-nbb --classpath "src:test:$(clojure -Spath)" test/run.cljk
-clojure -M:cljs -m cljs.main --target node -m avro.cljs-runner
-clojure -M:lint
+kbb -M:test
+kbb --backend sci --classpath "src:test:$(kbb -Spath)" test/run.cljk
+kbb -M:cljs -m cljs.main --target node -m avro.cljs-runner
+kbb -M:lint
 ```
 
 ## License

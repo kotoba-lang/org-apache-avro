@@ -84,7 +84,7 @@ def write_with_this_repo(out_dir: pathlib.Path, codec: str) -> pathlib.Path:
       (with-open [o (io/output-stream "{path}")]
         (.write o (byte-array (map unchecked-byte bs)))))
     """
-    subprocess.run(["clojure", "-M", "-e", program], cwd=REPO, check=True,
+    subprocess.run(["kbb", "-M", "-e", program], cwd=REPO, check=True,
                    stdout=subprocess.DEVNULL)
     return path
 
