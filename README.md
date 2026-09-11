@@ -172,7 +172,7 @@ That is a consequence of row-orientation, not a choice — and it is why
 
 ```
 clojure -M:test
-nbb --classpath "src:test:$(clojure -Spath)" test/run.cljs
+nbb --classpath "src:test:$(clojure -Spath)" test/run.cljk
 clojure -M:cljs -m cljs.main --target node -m avro.cljs-runner
 clojure -M:lint
 ```
