@@ -22,7 +22,7 @@
             [avro.reader-test :refer [read-fixture]]
             [clojure.edn :as edn]
             [clojure.test :refer [deftest is testing]]
-            #?(:clj [clojure.java.io :as io])))
+            #?(:clj [kotoba.io :as io])))
 
 (defn- read-text [name]
   #?(:clj (slurp (io/file "test/fixtures" name))

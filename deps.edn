@@ -4,7 +4,13 @@
  ;; records around it, so it is a `:materialize` format and has nothing to
  ;; provide `IColumnSource` with. Depending on the engine would advertise a
  ;; capability the format does not have.
- :deps {;; Avro schemas are JSON, carried inside the file that uses them.
+ :deps {
+        ;; kotoba.io replaced clojure.java.io here (2026-09-24). An explicit floor:
+        ;; kotoba.io carries clojure.java.io's file/as-file/as-relative-path/
+        ;; make-parents/delete-file from 98045c7, and tools.deps takes the NEWEST
+        ;; sha it is shown.
+        io.github.kotoba-lang/io {:git/sha "98045c7ad26c71c3505cb8fefdcbe0dcdf98f925"}
+        ;; Avro schemas are JSON, carried inside the file that uses them.
         io.github.kotoba-lang/json
         {:git/url "https://github.com/kotoba-lang/json.git"
          :git/sha "f6a534458ddfcb88e5e03facb35ebf61902e1bc4"}
