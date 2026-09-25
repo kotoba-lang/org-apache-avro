@@ -41,7 +41,8 @@
 
   The default is unchanged, and this is additive: nothing that decoded
   before decodes differently now."
-  (:refer-clojure :exclude [bytes long double]))
+  (:refer-clojure :exclude [bytes long double])
+  (:require [kotoba.bytes :as kbytes]))
 
 (def ^{:dynamic true
        :doc "`:exact-or-refuse` (default) throws on a ClojureScript value
@@ -133,7 +134,7 @@
     [(subvec (vec bs) i' (+ i' n)) (+ i' n)]))
 
 (defn utf8 [raw]
-  #?(:clj (String. (byte-array (map unchecked-byte raw)) "UTF-8")
+  #?(:clj (kbytes/utf8-string (byte-array (map unchecked-byte raw)))
      :cljs (.decode (js/TextDecoder. "utf-8") (js/Uint8Array. (clj->js (vec raw))))))
 
 (defn string-at [bs i]
@@ -233,7 +234,7 @@
 (defn utf8-of
   "String → UTF-8 bytes (no length prefix)."
   [s]
-  #?(:clj (vec (map #(bit-and % 0xff) (.getBytes (str s) "UTF-8")))
+  #?(:clj (vec (map #(bit-and % 0xff) (kbytes/utf8-bytes (str s))))
      :cljs (vec (.encode (js/TextEncoder.) (str s)))))
 
 (defn string-of "String → length-prefixed UTF-8." [s] (bytes-of (utf8-of s)))
